@@ -98,6 +98,7 @@ class PDFRecoveryApp:
 
         self.pdf_path = tk.StringVar()
         self.char_set_type = tk.StringVar(value="numeric")
+        self.char_casing = tk.StringVar(value="mixed")
         self.pwd_length = tk.IntVar(value=4)
         self.pwd_prefix = tk.StringVar(value="")
 
@@ -142,9 +143,23 @@ class PDFRecoveryApp:
         frame_charset = ttk.Frame(frame_settings)
         frame_charset.pack(fill="x", padx=5, pady=2)
         ttk.Label(frame_charset, text="Character Set:").pack(side="left")
-        ttk.Radiobutton(frame_charset, text="Numerical (0-9)", variable=self.char_set_type, value="numeric").pack(side="left", padx=5)
-        ttk.Radiobutton(frame_charset, text="Alphanumeric", variable=self.char_set_type, value="alphanumeric").pack(side="left", padx=5)
-        ttk.Radiobutton(frame_charset, text="Alpha + Symbols", variable=self.char_set_type, value="all").pack(side="left", padx=5)
+        ttk.Radiobutton(frame_charset, text="Numerical (0-9)", variable=self.char_set_type, value="numeric", command=self.update_casing_state).pack(side="left", padx=5)
+        ttk.Radiobutton(frame_charset, text="Alphanumeric", variable=self.char_set_type, value="alphanumeric", command=self.update_casing_state).pack(side="left", padx=5)
+        ttk.Radiobutton(frame_charset, text="Alpha + Symbols", variable=self.char_set_type, value="all", command=self.update_casing_state).pack(side="left", padx=5)
+
+        # Casing
+        self.frame_casing = ttk.Frame(frame_settings)
+        self.frame_casing.pack(fill="x", padx=5, pady=2)
+        ttk.Label(self.frame_casing, text="Casing:").pack(side="left")
+        self.rb_upper = ttk.Radiobutton(self.frame_casing, text="Uppercase (A-Z)", variable=self.char_casing, value="upper")
+        self.rb_upper.pack(side="left", padx=5)
+        self.rb_lower = ttk.Radiobutton(self.frame_casing, text="Lowercase (a-z)", variable=self.char_casing, value="lower")
+        self.rb_lower.pack(side="left", padx=5)
+        self.rb_mixed = ttk.Radiobutton(self.frame_casing, text="Mixed (A-Z, a-z)", variable=self.char_casing, value="mixed")
+        self.rb_mixed.pack(side="left", padx=5)
+
+        # Initial state setup
+        self.update_casing_state()
 
         # Length
         frame_length = ttk.Frame(frame_settings)
@@ -181,6 +196,12 @@ class PDFRecoveryApp:
 
         self.btn_stop = ttk.Button(frame_actions, text="Stop", command=self.stop_recovery, state="disabled")
         self.btn_stop.pack(side="right", expand=True, fill="x", padx=5)
+
+    def update_casing_state(self):
+        state = "disabled" if self.char_set_type.get() == "numeric" else "normal"
+        self.rb_upper.config(state=state)
+        self.rb_lower.config(state=state)
+        self.rb_mixed.config(state=state)
 
     def browse_file(self):
         filename = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
@@ -247,18 +268,29 @@ class PDFRecoveryApp:
         # Heuristic 2: Certain producers commonly default to alphanumeric name-date hashes
         if "pdf_gen" in full_text or "producer: itext" in full_text or "creator: crystal" in full_text:
             self.char_set_type.set("alphanumeric")
+            self.char_casing.set("lower")
             self.pwd_length.set(8)
-            messagebox.showinfo("Auto-Config", "Detected common enterprise PDF generator.\nSuggested pattern: 8-character alphanumeric.")
+            self.update_casing_state()
+            messagebox.showinfo("Auto-Config", "Detected common enterprise PDF generator.\nSuggested pattern: 8-character lowercase alphanumeric.")
             return
 
     def get_charset(self):
         ctype = self.char_set_type.get()
+        casing = self.char_casing.get()
+
         if ctype == "numeric":
             return string.digits
-        elif ctype == "alphanumeric":
-            return string.ascii_letters + string.digits
+
+        base_letters = string.ascii_letters
+        if casing == "upper":
+            base_letters = string.ascii_uppercase
+        elif casing == "lower":
+            base_letters = string.ascii_lowercase
+
+        if ctype == "alphanumeric":
+            return base_letters + string.digits
         else:
-            return string.ascii_letters + string.digits + string.punctuation
+            return base_letters + string.digits + string.punctuation
 
     def start_recovery(self):
         path = self.pdf_path.get()
