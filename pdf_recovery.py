@@ -8,9 +8,22 @@ import itertools
 import time
 from pypdf import PdfReader
 
-def worker(pdf_path, task_queue, res_queue, prog_queue, s_event):
+def worker(pdf_path, task_queue, res_queue, prog_queue, s_event, r6_auth=None):
     try:
-        reader = PdfReader(pdf_path)
+        reader = None
+        calc_hash_fn = None
+
+        if r6_auth:
+            try:
+                from pypdf._encryption import AlgV5
+                calc_hash_fn = AlgV5.calculate_hash
+            except ImportError:
+                print("Worker error: Missing pypdf._encryption.AlgV5. Falling back to slow path.")
+                r6_auth = None
+                reader = PdfReader(pdf_path)
+        else:
+            reader = PdfReader(pdf_path)
+
         while not s_event.is_set():
             try:
                 batch = task_queue.get(timeout=1)
@@ -20,44 +33,132 @@ def worker(pdf_path, task_queue, res_queue, prog_queue, s_event):
                 break
 
             count = 0
-            for pwd in batch:
-                if s_event.is_set():
-                    break
-                try:
-                    if reader.decrypt(pwd) != 0:
-                        res_queue.put(pwd)
-                        s_event.set()
-                        return
-                except Exception:
-                    pass
-                count += 1
+
+            # Check if batch is a numeric range tuple (start, end, prefix, generated_len)
+            if isinstance(batch, tuple) and len(batch) == 4:
+                start, end, prefix, gen_len = batch
+                for i in range(start, end):
+                    if s_event.is_set():
+                        break
+                    pwd = prefix + f"{i:0{gen_len}d}"
+                    try:
+                        if r6_auth and calc_hash_fn:
+                            # fast path
+                            pwd_bytes = pwd.encode('utf-8')[:127]
+                            hash_calc = calc_hash_fn(6, pwd_bytes, r6_auth["salt"], b"")
+                            if hash_calc == r6_auth["target"]:
+                                res_queue.put(pwd)
+                                s_event.set()
+                                return
+                        else:
+                            if reader.decrypt(pwd) != 0:
+                                res_queue.put(pwd)
+                                s_event.set()
+                                return
+                    except Exception as loop_e:
+                        print(f"Worker iteration error: {loop_e}")
+                        break # Prevent silent swallow looping over internal error
+                    count += 1
+            else:
+                # standard string list batch
+                for pwd in batch:
+                    if s_event.is_set():
+                        break
+                    try:
+                        if r6_auth and calc_hash_fn:
+                            pwd_bytes = pwd.encode('utf-8')[:127]
+                            hash_calc = calc_hash_fn(6, pwd_bytes, r6_auth["salt"], b"")
+                            if hash_calc == r6_auth["target"]:
+                                res_queue.put(pwd)
+                                s_event.set()
+                                return
+                        else:
+                            if reader.decrypt(pwd) != 0:
+                                res_queue.put(pwd)
+                                s_event.set()
+                                return
+                    except Exception as loop_e:
+                        print(f"Worker iteration error: {loop_e}")
+                        break
+                    count += 1
             prog_queue.put(count)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Worker fatal error: {e}")
 
 def password_generator(char_set, length, prefix):
     for p in itertools.product(char_set, repeat=length):
         yield prefix + "".join(p)
 
-def recovery_manager(pdf_path, char_set, length, prefix, result_queue, progress_queue, stop_event, total_passwords):
-    num_workers = multiprocessing.cpu_count()
-    gen = password_generator(char_set, length, prefix)
-    chunk_size = 500
-    task_queue = Queue(maxsize=100)
+def recovery_manager(pdf_path, char_set, length, prefix, result_queue, progress_queue, stop_event, total_passwords, requested_workers=None):
+    num_workers = requested_workers if requested_workers and requested_workers > 0 else multiprocessing.cpu_count()
 
+    # Try parsing for R6 fastpath
+    r6_auth = None
+    try:
+        reader = PdfReader(pdf_path)
+        if reader.is_encrypted:
+            trailer = reader.trailer
+            encrypt_dict = trailer.get("/Encrypt")
+            if encrypt_dict and encrypt_dict.get("/R") == 6 and encrypt_dict.get("/V") == 5:
+                u_obj = encrypt_dict.raw_get("/U")
+                u_value = u_obj.original_bytes if hasattr(u_obj, "original_bytes") else u_obj.get_object()
+                if isinstance(u_value, str):
+                    u_value = u_value.encode('latin1', errors='ignore')
+                r6_auth = {
+                    "salt": u_value[32:40],
+                    "target": u_value[:32]
+                }
+    except Exception:
+        pass
+
+    task_queue = Queue(maxsize=100)
     workers = []
     for _ in range(num_workers):
-        p = Process(target=worker, args=(pdf_path, task_queue, result_queue, progress_queue, stop_event))
+        p = Process(target=worker, args=(pdf_path, task_queue, result_queue, progress_queue, stop_event, r6_auth))
         p.start()
         workers.append(p)
 
     try:
-        batch = []
-        for pwd in gen:
-            if stop_event.is_set():
-                break
-            batch.append(pwd)
-            if len(batch) >= chunk_size:
+        if char_set == string.digits:
+            # Optimized numeric split
+            chunk_size = 10000
+            total_generated = 10 ** length
+
+            for start_idx in range(0, total_generated, chunk_size):
+                if stop_event.is_set():
+                    break
+                end_idx = min(start_idx + chunk_size, total_generated)
+                batch_tuple = (start_idx, end_idx, prefix, length)
+
+                while not stop_event.is_set():
+                    try:
+                        task_queue.put(batch_tuple, timeout=1)
+                        break
+                    except queue.Full:
+                        pass
+                    except Exception:
+                        break
+        else:
+            # Standard generation
+            chunk_size = 500
+            gen = password_generator(char_set, length, prefix)
+            batch = []
+            for pwd in gen:
+                if stop_event.is_set():
+                    break
+                batch.append(pwd)
+                if len(batch) >= chunk_size:
+                    while not stop_event.is_set():
+                        try:
+                            task_queue.put(batch, timeout=1)
+                            break
+                        except queue.Full:
+                            pass
+                        except Exception:
+                            break
+                    batch = []
+
+            if batch and not stop_event.is_set():
                 while not stop_event.is_set():
                     try:
                         task_queue.put(batch, timeout=1)
@@ -66,17 +167,6 @@ def recovery_manager(pdf_path, char_set, length, prefix, result_queue, progress_
                         pass
                     except Exception:
                         break
-                batch = []
-
-        if batch and not stop_event.is_set():
-            while not stop_event.is_set():
-                try:
-                    task_queue.put(batch, timeout=1)
-                    break
-                except queue.Full:
-                    pass
-                except Exception:
-                    break
 
     except Exception as e:
         print(f"Error in manager: {e}")
@@ -324,10 +414,21 @@ class PDFRecoveryApp:
         self.total_attempts = 0
         self.start_time = time.time()
         self.progress_var.set(0)
-        self.lbl_status.config(text="Recovering...")
+
+        mode_text = "Recovering..."
+        if charset == string.digits:
+            try:
+                reader = PdfReader(path)
+                encrypt_dict = reader.trailer.get("/Encrypt")
+                if encrypt_dict and encrypt_dict.get("/R") == 6 and encrypt_dict.get("/V") == 5:
+                    mode_text = "Mode: R6 AES-256 Numeric Optimized..."
+            except Exception:
+                pass
+
+        self.lbl_status.config(text=mode_text)
 
         self.manager_process = Process(target=recovery_manager, args=(
-            path, charset, length, prefix, self.result_queue, self.progress_queue, self.stop_event, self.total_passwords
+            path, charset, length, prefix, self.result_queue, self.progress_queue, self.stop_event, self.total_passwords, multiprocessing.cpu_count()
         ))
         self.manager_process.start()
 
@@ -355,8 +456,19 @@ class PDFRecoveryApp:
         speed = self.total_attempts / elapsed if elapsed > 0 else 0
         pct = (self.total_attempts / self.total_passwords) * 100 if self.total_passwords > 0 else 0
 
+        eta_str = "Calculating..."
+        if speed > 0 and self.total_attempts > 0:
+            rem_attempts = self.total_passwords - self.total_attempts
+            rem_sec = int(rem_attempts / speed)
+            mins, secs = divmod(rem_sec, 60)
+            hours, mins = divmod(mins, 60)
+            eta_str = f"{hours:02d}:{mins:02d}:{secs:02d}"
+
         self.progress_var.set(pct)
-        self.lbl_stats.config(text=f"{self.total_attempts} attempts | {speed:.2f} attempts/sec | {pct:.2f}%")
+        self.lbl_stats.config(
+            text=f"Attempts: {self.total_attempts} / {self.total_passwords} | Speed: {speed:.0f} attempts/sec | Prog: {pct:.2f}%\n"
+                 f"Elapsed: {int(elapsed)}s | ETA: {eta_str} | Workers: {multiprocessing.cpu_count()}"
+        )
 
         # Check for result
         if not self.result_queue.empty():
