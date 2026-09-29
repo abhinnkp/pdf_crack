@@ -1,0 +1,17 @@
+Generating Benchmark PDFs...
+Available System CPUs: 4
+--------------------------------------------------
+Running Benchmark with 1 Worker(s)
+  Baseline (reader.decrypt): 0.00 attempts/sec
+  Optimized (R6 Direct)    : 0.00 attempts/sec
+--------------------------------------------------
+Running Benchmark with 2 Worker(s)
+  Baseline (reader.decrypt): 212.60 attempts/sec
+  Optimized (R6 Direct)    : 512.69 attempts/sec
+  Speedup                  : 2.41x
+--------------------------------------------------
+Running Benchmark with 4 Worker(s)
+  Baseline (reader.decrypt): 603.28 attempts/sec
+  Optimized (R6 Direct)    : 1448.05 attempts/sec
+  Speedup                  : 2.40x
+--------------------------------------------------

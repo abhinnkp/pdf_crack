@@ -47,17 +47,28 @@ def worker(pdf_path, task_queue, res_queue, prog_queue, s_event, r6_auth=None):
                             pwd_bytes = pwd.encode('utf-8')[:127]
                             hash_calc = calc_hash_fn(6, pwd_bytes, r6_auth["salt"], b"")
                             if hash_calc == r6_auth["target"]:
-                                res_queue.put(pwd)
-                                s_event.set()
-                                return
+                                # Final verification (instantiate lazily if needed)
+                                if not reader:
+                                    reader = PdfReader(pdf_path)
+                                if reader.decrypt(pwd) != 0:
+                                    res_queue.put(pwd)
+                                    s_event.set()
+                                    return
+                                else:
+                                    res_queue.put(("ERROR", "R6 Hash matched but decrypt failed (Internal Validation Error)"))
+                                    s_event.set()
+                                    return
                         else:
+                            if not reader:
+                                reader = PdfReader(pdf_path)
                             if reader.decrypt(pwd) != 0:
                                 res_queue.put(pwd)
                                 s_event.set()
                                 return
                     except Exception as loop_e:
-                        print(f"Worker iteration error: {loop_e}")
-                        break # Prevent silent swallow looping over internal error
+                        res_queue.put(("ERROR", str(loop_e)))
+                        s_event.set()
+                        return
                     count += 1
             else:
                 # standard string list batch
@@ -69,21 +80,36 @@ def worker(pdf_path, task_queue, res_queue, prog_queue, s_event, r6_auth=None):
                             pwd_bytes = pwd.encode('utf-8')[:127]
                             hash_calc = calc_hash_fn(6, pwd_bytes, r6_auth["salt"], b"")
                             if hash_calc == r6_auth["target"]:
-                                res_queue.put(pwd)
-                                s_event.set()
-                                return
+                                # Final verification
+                                if not reader:
+                                    reader = PdfReader(pdf_path)
+                                if reader.decrypt(pwd) != 0:
+                                    res_queue.put(pwd)
+                                    s_event.set()
+                                    return
+                                else:
+                                    res_queue.put(("ERROR", "R6 Hash matched but decrypt failed (Internal Validation Error)"))
+                                    s_event.set()
+                                    return
                         else:
+                            if not reader:
+                                reader = PdfReader(pdf_path)
                             if reader.decrypt(pwd) != 0:
                                 res_queue.put(pwd)
                                 s_event.set()
                                 return
                     except Exception as loop_e:
-                        print(f"Worker iteration error: {loop_e}")
-                        break
+                        res_queue.put(("ERROR", str(loop_e)))
+                        s_event.set()
+                        return
                     count += 1
             prog_queue.put(count)
     except Exception as e:
-        print(f"Worker fatal error: {e}")
+        try:
+            res_queue.put(("ERROR", str(e)))
+            s_event.set()
+        except Exception:
+            pass
 
 def password_generator(char_set, length, prefix):
     for p in itertools.product(char_set, repeat=length):
@@ -99,7 +125,16 @@ def recovery_manager(pdf_path, char_set, length, prefix, result_queue, progress_
         if reader.is_encrypted:
             trailer = reader.trailer
             encrypt_dict = trailer.get("/Encrypt")
-            if encrypt_dict and encrypt_dict.get("/R") == 6 and encrypt_dict.get("/V") == 5:
+            # Verify R6 AESV3 schema fully before opting into the fast path
+            is_r6 = encrypt_dict and encrypt_dict.get("/R") == 6 and encrypt_dict.get("/V") == 5
+            is_aes = False
+            if is_r6:
+                cf = encrypt_dict.get("/CF", {})
+                std_cf = cf.get("/StdCF", {})
+                if std_cf.get("/CFM") == "/AESV3":
+                    is_aes = True
+
+            if is_r6 and is_aes:
                 u_obj = encrypt_dict.raw_get("/U")
                 u_value = u_obj.original_bytes if hasattr(u_obj, "original_bytes") else u_obj.get_object()
                 if isinstance(u_value, str):
@@ -254,7 +289,7 @@ class PDFRecoveryApp:
         # Length
         frame_length = ttk.Frame(frame_settings)
         frame_length.pack(fill="x", padx=5, pady=2)
-        ttk.Label(frame_length, text="Generated Length:").pack(side="left")
+        ttk.Label(frame_length, text="Generated Suffix Length:").pack(side="left")
         ttk.Spinbox(frame_length, from_=1, to=20, textvariable=self.pwd_length, width=5).pack(side="left", padx=5)
 
         # Prefix
@@ -420,8 +455,15 @@ class PDFRecoveryApp:
             try:
                 reader = PdfReader(path)
                 encrypt_dict = reader.trailer.get("/Encrypt")
-                if encrypt_dict and encrypt_dict.get("/R") == 6 and encrypt_dict.get("/V") == 5:
-                    mode_text = "Mode: R6 AES-256 Numeric Optimized..."
+                is_r6 = encrypt_dict and encrypt_dict.get("/R") == 6 and encrypt_dict.get("/V") == 5
+                is_aes = False
+                if is_r6:
+                    cf = encrypt_dict.get("/CF", {})
+                    std_cf = cf.get("/StdCF", {})
+                    if std_cf.get("/CFM") == "/AESV3":
+                        is_aes = True
+                if is_r6 and is_aes:
+                    mode_text = "Encryption: R6 / AES-256 | Target: User/Open Password | Mode: Direct R6 Validation"
             except Exception:
                 pass
 
@@ -473,13 +515,18 @@ class PDFRecoveryApp:
         # Check for result
         if not self.result_queue.empty():
             try:
-                pwd = self.result_queue.get_nowait()
+                result = self.result_queue.get_nowait()
                 self.stop_event.set()
                 self.is_running = False
                 self.btn_start.config(state="normal")
                 self.btn_stop.config(state="disabled")
-                self.lbl_status.config(text="Success!")
-                messagebox.showinfo("Success", f"Password recovered: {pwd}")
+
+                if isinstance(result, tuple) and result[0] == "ERROR":
+                    self.lbl_status.config(text="Halted: Internal Worker Error")
+                    messagebox.showerror("Internal Error", f"Worker failed:\n{result[1]}")
+                else:
+                    self.lbl_status.config(text="Success!")
+                    messagebox.showinfo("Success", f"Password recovered: {result}")
                 return
             except Exception:
                 pass
