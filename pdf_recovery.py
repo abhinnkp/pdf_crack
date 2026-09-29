@@ -94,7 +94,7 @@ class PDFRecoveryApp:
     def __init__(self, root):
         self.root = root
         self.root.title("PDF Key Recovery Utility")
-        self.root.geometry("600x450")
+        self.root.geometry("600x600")
 
         self.pdf_path = tk.StringVar()
         self.char_set_type = tk.StringVar(value="numeric")
@@ -126,6 +126,13 @@ class PDFRecoveryApp:
 
         ttk.Entry(frame_file, textvariable=self.pdf_path, state="readonly").pack(side="left", fill="x", expand=True, padx=5, pady=5)
         ttk.Button(frame_file, text="Browse...", command=self.browse_file).pack(side="right", padx=5, pady=5)
+
+        # Inspector
+        self.frame_inspector = ttk.LabelFrame(self.root, text="Metadata & Security Inspector")
+        self.frame_inspector.pack(fill="x", padx=10, pady=5)
+
+        self.txt_inspector = tk.Text(self.frame_inspector, height=6, state="disabled", bg="#f0f0f0")
+        self.txt_inspector.pack(fill="x", padx=5, pady=5)
 
         # Settings
         frame_settings = ttk.LabelFrame(self.root, text="Key Pattern & Composition")
@@ -179,6 +186,70 @@ class PDFRecoveryApp:
         filename = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
         if filename:
             self.pdf_path.set(filename)
+            self.inspect_pdf(filename)
+
+    def inspect_pdf(self, path):
+        self.txt_inspector.config(state="normal")
+        self.txt_inspector.delete(1.0, tk.END)
+
+        try:
+            reader = PdfReader(path)
+
+            inspector_text = []
+            inspector_text.append(f"Encrypted: {reader.is_encrypted}")
+
+            # Metadata
+            try:
+                metadata = reader.metadata
+                if metadata:
+                    inspector_text.append("--- Metadata ---")
+                    for k, v in metadata.items():
+                        inspector_text.append(f"{k.strip('/')}: {v}")
+                else:
+                    inspector_text.append("--- Metadata ---")
+                    inspector_text.append("None or unreadable.")
+            except Exception as e:
+                inspector_text.append("--- Metadata ---")
+                inspector_text.append("Encrypted (cannot read without password).")
+
+            # Security
+            trailer = reader.trailer
+            encrypt_dict = trailer.get("/Encrypt")
+            if encrypt_dict:
+                inspector_text.append("--- Security Properties ---")
+                for k, v in encrypt_dict.items():
+                    # Format byte strings for display if needed, ignore long byte streams
+                    if k in ['/O', '/U', '/OE', '/UE', '/Perms']:
+                        inspector_text.append(f"{k.strip('/')}: <binary data>")
+                    else:
+                        inspector_text.append(f"{k.strip('/')}: {v}")
+
+            self.txt_inspector.insert(tk.END, "\n".join(inspector_text))
+
+            # Run heuristics
+            self.run_heuristics(inspector_text)
+
+        except Exception as e:
+            self.txt_inspector.insert(tk.END, f"Error reading PDF:\n{e}")
+
+        self.txt_inspector.config(state="disabled")
+
+    def run_heuristics(self, inspector_lines):
+        full_text = "\n".join(inspector_lines).lower()
+
+        # Heuristic 1: Common banking or financial PIN structures
+        if "bank" in full_text or "statement" in full_text or "financial" in full_text:
+            self.char_set_type.set("numeric")
+            self.pwd_length.set(6)
+            messagebox.showinfo("Auto-Config", "Detected financial document signature.\nSuggested pattern: 6-digit numeric PIN.")
+            return
+
+        # Heuristic 2: Certain producers commonly default to alphanumeric name-date hashes
+        if "pdf_gen" in full_text or "producer: itext" in full_text or "creator: crystal" in full_text:
+            self.char_set_type.set("alphanumeric")
+            self.pwd_length.set(8)
+            messagebox.showinfo("Auto-Config", "Detected common enterprise PDF generator.\nSuggested pattern: 8-character alphanumeric.")
+            return
 
     def get_charset(self):
         ctype = self.char_set_type.get()
