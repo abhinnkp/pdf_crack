@@ -115,12 +115,14 @@ def password_generator(char_set, length, prefix):
     for p in itertools.product(char_set, repeat=length):
         yield prefix + "".join(p)
 
-def recovery_manager(pdf_path, char_set, length, prefix, result_queue, progress_queue, stop_event, total_passwords, requested_workers=None):
+def recovery_manager(pdf_path, char_set, length, prefix, result_queue, progress_queue, stop_event, total_passwords, requested_workers=None, force_slowpath=False):
     num_workers = requested_workers if requested_workers and requested_workers > 0 else multiprocessing.cpu_count()
 
     # Try parsing for R6 fastpath
     r6_auth = None
     try:
+        if force_slowpath:
+            raise Exception("Forced Slowpath")
         reader = PdfReader(pdf_path)
         if reader.is_encrypted:
             trailer = reader.trailer
@@ -204,7 +206,8 @@ def recovery_manager(pdf_path, char_set, length, prefix, result_queue, progress_
                         break
 
     except Exception as e:
-        print(f"Error in manager: {e}")
+        result_queue.put(("ERROR", str(e)))
+        stop_event.set()
 
     for _ in range(num_workers):
         try:
@@ -214,6 +217,13 @@ def recovery_manager(pdf_path, char_set, length, prefix, result_queue, progress_
 
     for p in workers:
         p.join()
+
+    # Emit explicit search complete
+    try:
+        if not stop_event.is_set():
+            result_queue.put(("SEARCH_COMPLETE",))
+    except Exception:
+        pass
 
 class PDFRecoveryApp:
     def __init__(self, root):
@@ -512,35 +522,51 @@ class PDFRecoveryApp:
                  f"Elapsed: {int(elapsed)}s | ETA: {eta_str} | Workers: {multiprocessing.cpu_count()}"
         )
 
-        # Check for result
+        # Check for result or state changes from manager
         if not self.result_queue.empty():
             try:
                 result = self.result_queue.get_nowait()
-                self.stop_event.set()
-                self.is_running = False
-                self.btn_start.config(state="normal")
-                self.btn_stop.config(state="disabled")
 
-                if isinstance(result, tuple) and result[0] == "ERROR":
-                    self.lbl_status.config(text="Halted: Internal Worker Error")
-                    messagebox.showerror("Internal Error", f"Worker failed:\n{result[1]}")
+                if isinstance(result, tuple):
+                    status_type = result[0]
+                    if status_type == "ERROR":
+                        self.stop_event.set()
+                        self.is_running = False
+                        self.btn_start.config(state="normal")
+                        self.btn_stop.config(state="disabled")
+                        self.lbl_status.config(text="Halted: Internal Worker Error")
+                        messagebox.showerror("Internal Error", f"Worker failed:\n{result[1]}")
+                        return
+                    elif status_type == "SEARCH_COMPLETE":
+                        self.stop_event.set()
+                        self.is_running = False
+                        self.btn_start.config(state="normal")
+                        self.btn_stop.config(state="disabled")
+                        self.lbl_status.config(text="Finished. Password not found.")
+                        messagebox.showinfo("Result", "Password not found in the given pattern.")
+                        return
                 else:
+                    # Password found
+                    self.stop_event.set()
+                    self.is_running = False
+                    self.btn_start.config(state="normal")
+                    self.btn_stop.config(state="disabled")
                     self.lbl_status.config(text="Success!")
                     messagebox.showinfo("Success", f"Password recovered: {result}")
-                return
+                    return
             except Exception:
                 pass
 
-        # Check if finished without result
+        # Check if forcefully killed without explicit SEARCH_COMPLETE
         if not self.manager_process.is_alive() and self.progress_queue.empty() and self.result_queue.empty():
-            self.is_running = False
-            self.btn_start.config(state="normal")
-            self.btn_stop.config(state="disabled")
-            if self.stop_event.is_set():
-                self.lbl_status.config(text="Stopped by user.")
-            else:
-                self.lbl_status.config(text="Finished. Password not found.")
-                messagebox.showinfo("Result", "Password not found in the given pattern.")
+            if self.is_running:
+                self.is_running = False
+                self.btn_start.config(state="normal")
+                self.btn_stop.config(state="disabled")
+                if self.stop_event.is_set():
+                    self.lbl_status.config(text="Stopped by user.")
+                else:
+                    self.lbl_status.config(text="Error: Process terminated unexpectedly.")
             return
 
         self.root.after(100, self.update_status)
